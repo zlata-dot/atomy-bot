@@ -458,29 +458,52 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if data == "plan:30":
-        if not can_use_premium_feature(user_id):
+        # 1) Premium-only
+        prem, until = premium_status(user_id)
+        if not prem:
             if q.message:
                 await q.message.reply_text(
                     "📅 План на 30 дней доступен только в Premium.\n\n"
                     "Premium даёт:\n"
-                    "• ⭐ Избранное / Мой набор\n"
                     "• 📅 План на 30 дней\n"
+                    "• ⭐ Избранное / Мой набор\n"
                     "• ✅ Безлимитные проверки составов\n\n"
                     f"Стоимость: {SUB_PRICE_RUB} ₽ / 30 дней (услуга доступа).\n"
-                    "ℹ️ Косметика приобретается отдельно.",
+                    "Нажми «💳 Premium».",
                     reply_markup=main_menu_keyboard()
                 )
             return
 
+        # 2) Profile required
         prof = db.get_profile(user_id)
-        favs = db.list_favorites(user_id)
-
         if not prof or not prof.get("skin_type"):
             if q.message:
-                await q.message.reply_text("Сначала пройди тест кожи.", reply_markup=main_menu_keyboard())
+                await q.message.reply_text(
+                    "Сначала пройди тест кожи, чтобы я могла составить план.",
+                    reply_markup=main_menu_keyboard()
+                )
             return
 
-        plan_text = build_plan_30(prof, favs)
+        # 3) Build plan (ВАЖНО: build_plan_30 принимает ТОЛЬКО profile)
+        try:
+            plan_text = build_plan_30(prof)
+        except Exception as e:
+            # чтобы ты сразу видела причину в Telegram (если ADMIN_ID задан)
+            if ADMIN_ID:
+                try:
+                    await context.application.bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=f"❌ Ошибка plan:30 для user_id={user_id}\n{type(e).__name__}: {e}"
+                    )
+                except Exception:
+                    pass
+
+            if q.message:
+                await q.message.reply_text(
+                    "❌ План временно недоступен (ошибка в коде). Я уже отправила детали админу.",
+                    reply_markup=main_menu_keyboard()
+                )
+            return
 
         if q.message:
             await q.message.reply_text(plan_text, reply_markup=main_menu_keyboard())
