@@ -1,0 +1,8 @@
+python-dotenv==1.0.1
+python-telegram-bot==21.6
+requests
+beautifulsoup4
+lxml
+Flask==3.0.2
+yookassa==3.5.0
+reportlab==4.2.5
