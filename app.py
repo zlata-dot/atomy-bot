@@ -52,14 +52,9 @@ try:
 except Exception as e:
     print(f"Каталог не загружен: {e}")
 
-# ---- USER STATE ----
-# Мы храним состояние теста:
-# USER_STATE[user_id] = {
-#   "stage": "age" | "gender" | "skin",
-#   "age": int,
-#   "gender": "Женщина"|"Мужчина",
-#   "step": int, "answers": [int]
-# }
+# USER_STATE:
+# - test stages: age -> gender -> skin
+# - inci stage: inci
 USER_STATE = {}
 
 QUESTIONS = [
@@ -103,22 +98,21 @@ PRIVACY_TEXT = """
 
 1) Общие положения
 Я (самозанятая/самозанятый) предоставляю доступ к сервису подбора косметики и анализа составов.
-Настоящая политика объясняет, какие данные обрабатываются и зачем.
 
 2) Какие данные могут обрабатываться
 • Telegram user_id, имя/никнейм (если доступно)
 • ответы на тест по коже (тип кожи, чувствительность, предпочтения)
 • история взаимодействия с ботом (рекомендации, выбранные товары)
-• данные об оплате подписки (подтверждение/статус). Реквизиты банковской карты я не получаю.
+• данные об оплате подписки (подтверждение/статус)
 
 3) Цели обработки
 • создание и хранение профиля кожи
 • персональные рекомендации и подбор ухода
-• предоставление доступа Premium и учёт оплат
-• поддержка пользователей и улучшение качества сервиса
+• доступ Premium и учёт оплат
+• поддержка пользователей
 
 4) Срок хранения
-Данные хранятся, пока вы пользуетесь сервисом, либо до запроса на удаление.
+Пока вы пользуетесь сервисом, либо до запроса на удаление.
 
 5) Передача третьим лицам
 Данные не продаются и не передаются третьим лицам для рекламы.
@@ -169,10 +163,11 @@ def premium_screen_text(user_id: int) -> str:
     lines.append("Что даёт Premium:")
     lines.append("• Безлимитные проверки составов (INCI)")
     lines.append("• Расширенный подбор ухода под тип кожи и цели")
-    lines.append("• Профиль + история рекомендаций")
+    lines.append("• Профиль + избранное/набор")
+    lines.append("• План на 30 дней")
     lines.append("• Поддержка администратора")
     lines.append("")
-    lines.append("ℹ️ Важно: вы оплачиваете услугу доступа к сервису. Косметика приобретается отдельно.")
+    lines.append("ℹ️ Важно: вы оплачиваете услугу доступа. Косметика приобретается отдельно.")
     lines.append("")
     lines.append(f"Ваш статус: {'✅ активен до ' + until if prem else 'не активен'}")
     lines.append(f"Бесплатные проверки использовано: {min(used, 3)}/3")
@@ -183,6 +178,9 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Пройти тест кожи", callback_data="test:start")],
         [InlineKeyboardButton("🧴 Подобрать уход Atomy (RU)", callback_data="routine:make")],
+        [InlineKeyboardButton("⭐ Мой набор", callback_data="fav:show")],
+        [InlineKeyboardButton("📅 План на 30 дней", callback_data="plan:30")],
+        [InlineKeyboardButton("🔎 Проверка состава (INCI)", callback_data="inci:start")],
         [InlineKeyboardButton("👤 Мой профиль", callback_data="profile:show")],
         [InlineKeyboardButton("💳 Premium", callback_data="premium:screen")],
         [InlineKeyboardButton("📄 Условия Premium", callback_data="premium:terms")],
@@ -216,6 +214,21 @@ def gender_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Женщина", callback_data="test:gender:woman")],
         [InlineKeyboardButton("Мужчина", callback_data="test:gender:man")],
         [InlineKeyboardButton("⛔️ Отменить тест", callback_data="test:cancel")],
+    ])
+
+
+def _fav_item_keyboard(step: str, idx: int, url: str | None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("⭐ Добавить в набор", callback_data=f"fav:add:{step}:{idx}")]]
+    if url:
+        rows.append([InlineKeyboardButton("🔗 Открыть на сайте", url=url)])
+    return InlineKeyboardMarkup(rows)
+
+
+def _myset_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧾 Оформить через администратора", callback_data="lead:send")],
+        [InlineKeyboardButton("🗑 Очистить набор", callback_data="fav:clear")],
+        [InlineKeyboardButton("⬅️ В меню", callback_data="menu:home")],
     ])
 
 
@@ -285,15 +298,142 @@ def calc_profile(answers: list[int]) -> dict:
     }
 
 
-# ---------------- commands ----------------
+import re
 
+def _pick_item(items: list[str], prefer: list[str], avoid: list[str]) -> str | None:
+    """
+    Выбирает 1 лучшее средство из списка по ключевым словам.
+    prefer — слова, которые хотим найти
+    avoid — слова, которых хотим избегать
+    """
+    if not items:
+        return None
+
+    # 1) Prefer + not avoid
+    for it in items:
+        s = it.lower()
+        if any(p in s for p in prefer) and not any(a in s for a in avoid):
+            return it
+
+    # 2) Not avoid
+    for it in items:
+        s = it.lower()
+        if not any(a in s for a in avoid):
+            return it
+
+    # 3) fallback
+    return items[0]
+
+
+def build_plan_30(profile: dict, favorites: list) -> str:
+    """
+    План ухода на основе выбранного набора.
+    Утро и вечер отличаются:
+    - утром избегаем evening/night
+    - вечером предпочитаем evening/night
+    - SPF только утром
+    """
+    if not favorites:
+        return (
+            "📅 План на 30 дней\n\n"
+            "Сначала добавь средства в ⭐ Мой набор.\n"
+            "Это можно сделать в разделе «🧴 Подобрать уход»."
+        )
+
+    steps = {
+        "cleanser": [],
+        "toner": [],
+        "serum": [],
+        "cream": [],
+        "sunscreen": [],
+    }
+
+    for f in favorites:
+        step = f.get("step")
+        name = f.get("name")
+        if step in steps and name:
+            steps[step].append(name)
+
+    # Ключевые слова
+    morning_prefer = ["morning", "day", "daily", "днев", "утрен", "spf", "sun", "uv"]
+    morning_avoid = ["evening", "night", "pm", "sleep", "overnight", "вечер", "ноч"]
+
+    evening_prefer = ["evening", "night", "pm", "sleep", "overnight", "вечер", "ноч"]
+    evening_avoid = []  # вечером не избегаем
+
+    # Выбор средств для утра/вечера по каждому шагу
+    am = {}
+    pm = {}
+
+    for step in ["cleanser", "toner", "serum", "cream"]:
+        am[step] = _pick_item(steps[step], prefer=morning_prefer, avoid=morning_avoid)
+        pm[step] = _pick_item(steps[step], prefer=evening_prefer, avoid=evening_avoid)
+
+    # SPF — только утром
+    am["sunscreen"] = _pick_item(steps["sunscreen"], prefer=["spf", "sun", "uv", "солн", "spf"], avoid=[])
+    pm["sunscreen"] = None
+
+    # Заголовок и список набора
+    lines = []
+    lines.append("📅 План ухода на 30 дней")
+    lines.append("")
+    lines.append("Ваш набор:")
+
+    def _step_title(step: str) -> str:
+        return {
+            "cleanser": "Очищение",
+            "toner": "Тонер",
+            "serum": "Сыворотка",
+            "cream": "Крем",
+            "sunscreen": "SPF",
+        }.get(step, step)
+
+    for step, items in steps.items():
+        if not items:
+            continue
+        lines.append("")
+        lines.append(_step_title(step))
+        for it in items:
+            lines.append(f"• {it}")
+
+    lines.append("")
+    lines.append("────")
+    lines.append("")
+    lines.append("🌅 Утро")
+
+    n = 1
+    for step in ["cleanser", "toner", "serum", "cream", "sunscreen"]:
+        if am.get(step):
+            lines.append(f"{n}️⃣ {am[step]}")
+            n += 1
+
+    lines.append("")
+    lines.append("🌙 Вечер")
+
+    n = 1
+    for step in ["cleanser", "toner", "serum", "cream"]:
+        if pm.get(step):
+            lines.append(f"{n}️⃣ {pm[step]}")
+            n += 1
+
+    lines.append("")
+    lines.append("💡 Подсказка")
+    lines.append("• Если средство содержит слова Evening/Night — используйте его вечером.")
+    lines.append("• SPF используется только утром.")
+    lines.append("")
+    lines.append("ℹ️ План — информационный. Косметика приобретается отдельно.")
+
+    return "\n".join(lines)
+
+
+# ---------------- commands ----------------
 async def start(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db.ensure_user(user_id)
     await update.message.reply_text(
         "Привет! 👋\n\n"
         "Я бот по подбору косметики Атоми (Россия).\n"
-        "Сначала я задам возраст и пол, затем 8 вопросов о коже — и подберу уход из каталога atomy.ru + покажу цены.\n\n"
+        "Пройди тест (возраст → пол → кожа) — и я подберу уход из каталога atomy.ru + покажу цены.\n\n"
         "ℹ️ Важно: бот не продаёт косметику. Косметика приобретается отдельно.\n"
         f"Premium — услуга доступа ({SUB_PRICE_RUB} ₽ / 30 дней).",
         reply_markup=main_menu_keyboard()
@@ -304,22 +444,20 @@ async def cmd_profile(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db.ensure_user(user_id)
     prof = db.get_profile(user_id)
-    if not prof:
+    if not prof or not prof.get("skin_type"):
         await update.message.reply_text("Профиля ещё нет. Нажми «✅ Пройти тест кожи».", reply_markup=main_menu_keyboard())
         return
 
     prem, until = premium_status(user_id)
-    age = prof.get("age")
-    gender = prof.get("gender")
 
     await update.message.reply_text(
         "👤 Твой профиль:\n"
-        f"• Возраст: {age if age is not None else '—'}\n"
-        f"• Пол: {gender or '—'}\n"
-        f"• Тип кожи: {prof.get('skin_type') or '—'}\n"
-        f"• Барьер: {prof.get('barrier_state') or '—'}\n"
-        f"• Чувствительность: {prof.get('sensitivity') or '—'}\n"
-        f"• Проблемы: {prof.get('concerns') or '—'}\n\n"
+        f"• Возраст: {prof.get('age') if prof.get('age') is not None else '—'}\n"
+        f"• Пол: {prof.get('gender') or '—'}\n"
+        f"• Тип кожи: {prof.get('skin_type')}\n"
+        f"• Барьер: {prof.get('barrier_state')}\n"
+        f"• Чувствительность: {prof.get('sensitivity')}\n"
+        f"• Проблемы: {prof.get('concerns')}\n\n"
         f"Premium: {'✅ до ' + until if prem else 'нет'}",
         reply_markup=main_menu_keyboard()
     )
@@ -359,7 +497,6 @@ async def cmd_status(update: Update, _context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- admin commands ---
-
 async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update.effective_user.id):
         return
@@ -396,37 +533,28 @@ async def cmd_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------- callbacks ----------------
-
-async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     user_id = q.from_user.id
     db.ensure_user(user_id)
 
-    if q.data == "admin:show":
+    data = q.data
+
+    # ---- MENU ----
+    if data == "menu:home":
+        if q.message:
+            await q.message.reply_text("Главное меню:", reply_markup=main_menu_keyboard())
+        return
+
+    # ---- ADMIN ----
+    if data == "admin:show":
         if q.message:
             await q.message.reply_text("\n".join(admin_block_lines()), reply_markup=main_menu_keyboard())
         return
 
-    if q.data == "premium:screen":
-        if q.message:
-            await q.message.reply_text(premium_screen_text(user_id), reply_markup=premium_screen_keyboard())
-        return
-
-    if q.data == "premium:terms":
-        if q.message:
-            await q.message.reply_text(TERMS_TEXT, reply_markup=main_menu_keyboard())
-        return
-
-    if q.data == "premium:pdf":
-        pdf_bytes = generate_offer_pdf(TERMS_TEXT, title="Условия Premium (публичная оферта)")
-        bio = BytesIO(pdf_bytes)
-        bio.name = "offer_premium.pdf"
-        if q.message:
-            await q.message.reply_document(document=InputFile(bio), caption="📄 PDF-оферта Premium")
-        return
-
-    if q.data == "privacy:show":
+    # ---- PRIVACY ----
+    if data == "privacy:show":
         if PRIVACY_URL:
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("Открыть политику на сайте", url=PRIVACY_URL)]])
             if q.message:
@@ -436,7 +564,26 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.message.reply_text(PRIVACY_TEXT, reply_markup=main_menu_keyboard())
         return
 
-    if q.data == "premium:status":
+    # ---- PREMIUM ----
+    if data == "premium:screen":
+        if q.message:
+            await q.message.reply_text(premium_screen_text(user_id), reply_markup=premium_screen_keyboard())
+        return
+
+    if data == "premium:terms":
+        if q.message:
+            await q.message.reply_text(TERMS_TEXT, reply_markup=main_menu_keyboard())
+        return
+
+    if data == "premium:pdf":
+        pdf_bytes = generate_offer_pdf(TERMS_TEXT, title="Условия Premium (публичная оферта)")
+        bio = BytesIO(pdf_bytes)
+        bio.name = "offer_premium.pdf"
+        if q.message:
+            await q.message.reply_document(document=InputFile(bio), caption="📄 PDF-оферта Premium")
+        return
+
+    if data == "premium:status":
         prem, until = premium_status(user_id)
         if q.message:
             await q.message.reply_text(
@@ -445,7 +592,7 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    if q.data == "premium:transfer":
+    if data == "premium:transfer":
         lines = []
         lines.append(f"💸 Перевод по реквизитам: {SUB_PRICE_RUB} ₽")
         lines.append("")
@@ -466,7 +613,7 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("\n".join(lines), reply_markup=premium_screen_keyboard())
         return
 
-    if q.data == "premium:send_id":
+    if data == "premium:send_id":
         if ADMIN_ID == 0:
             if q.message:
                 await q.message.reply_text("❌ Администратор не настроен (ADMIN_ID=0).")
@@ -475,13 +622,7 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uname = q.from_user.username or "-"
         full_name = (q.from_user.full_name or "-").strip()
 
-        prof = db.get_profile(user_id)
-        prof_line = ""
-        if prof:
-            prof_line = (
-                f"\nПрофиль: возраст={prof.get('age') or '-'}, пол={prof.get('gender') or '-'}, "
-                f"{prof.get('skin_type') or '-'} | {prof.get('sensitivity') or '-'} | {prof.get('concerns') or '-'}"
-            )
+        prof = db.get_profile(user_id) or {}
         prem, until = premium_status(user_id)
 
         text_to_admin = (
@@ -489,8 +630,9 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"user_id: {user_id}\n"
             f"username: @{uname}\n"
             f"имя: {full_name}\n"
-            f"Premium: {'активен до ' + until if prem else 'не активен'}"
-            f"{prof_line}\n\n"
+            f"Premium: {'активен до ' + until if prem else 'не активен'}\n"
+            f"Профиль: возраст={prof.get('age') or '-'}, пол={prof.get('gender') or '-'}, "
+            f"{prof.get('skin_type') or '-'} | {prof.get('sensitivity') or '-'} | {prof.get('concerns') or '-'}\n\n"
             "Команды:\n"
             f"/grant {user_id} 30\n"
             f"/receipt {user_id}\n"
@@ -502,29 +644,18 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if q.message:
                 await q.message.reply_text(
                     "❌ Не могу написать админу (Telegram запретил).\n\n"
-                    "✅ Решение:\n"
-                    "1) Админ должен открыть этого бота и нажать Start\n"
-                    "2) Повторите кнопку «Отправить ID админу»\n\n"
-                    f"Ваш user_id: {user_id}\n"
-                    f"Админ: {ADMIN_TG or '(укажи ADMIN_TG в .env)'}",
-                    reply_markup=main_menu_keyboard()
-                )
-            return
-        except Exception:
-            if q.message:
-                await q.message.reply_text(
-                    "❌ Ошибка отправки админу. Проверь ADMIN_ID.\n"
+                    "✅ Решение: админ должен открыть бота и нажать Start.\n\n"
                     f"Ваш user_id: {user_id}",
                     reply_markup=main_menu_keyboard()
                 )
             return
 
         if q.message:
-            await q.message.reply_text("✅ Отправила ваш ID админу. Он активирует Premium.", reply_markup=main_menu_keyboard())
+            await q.message.reply_text("✅ Отправила ваш ID админу.", reply_markup=main_menu_keyboard())
         return
 
-    # --- PROFILE BUTTON ---
-    if q.data == "profile:show":
+    # ---- PROFILE ----
+    if data == "profile:show":
         prof = db.get_profile(user_id)
         prem, until = premium_status(user_id)
         if q.message:
@@ -535,112 +666,306 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "👤 Твой профиль:\n"
                     f"• Возраст: {prof.get('age') if prof.get('age') is not None else '—'}\n"
                     f"• Пол: {prof.get('gender') or '—'}\n"
-                    f"• Тип кожи: {prof.get('skin_type') or '—'}\n"
-                    f"• Барьер: {prof.get('barrier_state') or '—'}\n"
-                    f"• Чувствительность: {prof.get('sensitivity') or '—'}\n"
-                    f"• Проблемы: {prof.get('concerns') or '—'}\n\n"
+                    f"• Тип кожи: {prof.get('skin_type')}\n"
+                    f"• Барьер: {prof.get('barrier_state')}\n"
+                    f"• Чувствительность: {prof.get('sensitivity')}\n"
+                    f"• Проблемы: {prof.get('concerns')}\n\n"
                     f"Premium: {'✅ до ' + until if prem else 'нет'}",
                     reply_markup=main_menu_keyboard()
                 )
         return
 
-    # --- TEST START (NOW ASK AGE FIRST) ---
-    if q.data == "test:start":
+    # ---- TEST START: AGE ----
+    if data == "test:start":
         USER_STATE[user_id] = {"stage": "age"}
         if q.message:
             await q.message.reply_text("Сколько тебе лет? Напиши числом (например 25).")
         return
 
-    if q.data == "test:cancel":
+    # ---- TEST CANCEL ----
+    if data == "test:cancel":
         USER_STATE.pop(user_id, None)
         if q.message:
             await q.message.reply_text("Тест отменён.", reply_markup=main_menu_keyboard())
         return
 
+    # ---- TEST GENDER ----
+    if data.startswith("test:gender:"):
+        st = USER_STATE.get(user_id)
+        if not st or st.get("stage") != "gender":
+            return
+        g = data.split(":")[2]
+        gender = "Женщина" if g == "woman" else "Мужчина"
+        st["gender"] = gender
+        st["stage"] = "skin"
+        st["step"] = 0
+        st["answers"] = []
+        USER_STATE[user_id] = st
 
-async def on_gender_select(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    user_id = q.from_user.id
+        db.set_demographics(user_id, int(st["age"]), gender)
 
-    state = USER_STATE.get(user_id)
-    if not state or state.get("stage") != "gender":
-        return
-
-    # callback_data: "test:gender:woman" или "test:gender:man"
-    parts = q.data.split(":")
-    if len(parts) != 3:
         if q.message:
-            await q.message.reply_text("Ошибка выбора пола. Попробуй ещё раз.")
+            await q.message.reply_text("Отлично! Теперь отвечай на вопросы про кожу 👇")
+            await q.message.reply_text(QUESTIONS[0]["text"], reply_markup=question_keyboard(0))
         return
 
-    g = parts[2]
-    gender = "Женщина" if g == "woman" else "Мужчина" if g == "man" else None
-    if not gender:
+    # ---- TEST ANSWER ----
+    if data.startswith("test:answer:"):
+        st = USER_STATE.get(user_id)
+        if not st or st.get("stage") != "skin":
+            return
+
+        _, _, q_index_str, opt_index_str = data.split(":")
+        q_index = int(q_index_str)
+        opt_index = int(opt_index_str)
+
+        if q_index != st["step"]:
+            return
+
+        st["answers"].append(opt_index)
+        st["step"] += 1
+        USER_STATE[user_id] = st
+
+        if st["step"] < len(QUESTIONS):
+            i = st["step"]
+            if q.message:
+                await q.message.reply_text(QUESTIONS[i]["text"], reply_markup=question_keyboard(i))
+            return
+
+        prof = calc_profile(st["answers"])
+        db.save_profile(user_id, prof["skin_type"], prof["barrier_state"], prof["sensitivity"], prof["concerns"])
+        age = st.get("age")
+        gender = st.get("gender")
+        USER_STATE.pop(user_id, None)
+
         if q.message:
-            await q.message.reply_text("Ошибка выбора пола. Попробуй ещё раз.")
+            await q.message.reply_text(
+                "✅ Профиль сохранён!\n\n"
+                f"• Возраст: {age}\n"
+                f"• Пол: {gender}\n"
+                f"• Тип кожи: {prof['skin_type']}\n"
+                f"• Барьер: {prof['barrier_state']}\n"
+                f"• Чувствительность: {prof['sensitivity']}\n"
+                f"• Проблемы: {prof['concerns']}\n\n"
+                "Теперь нажми «🧴 Подобрать уход Atomy (RU)».",
+                reply_markup=main_menu_keyboard()
+            )
         return
 
-    state["gender"] = gender
-    state["stage"] = "skin"
-    state["step"] = 0
-    state["answers"] = []
-    USER_STATE[user_id] = state
-
-    # сохраняем возраст+пол в БД
-    db.set_demographics(user_id, int(state["age"]), gender)
-
-    if q.message:
-        await q.message.reply_text("Отлично! Теперь отвечай на вопросы про кожу 👇")
-        await q.message.reply_text(QUESTIONS[0]["text"], reply_markup=question_keyboard(0))
-
-
-async def on_test_answer(update: Update, _context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    user_id = q.from_user.id
-
-    state = USER_STATE.get(user_id)
-    if not state or state.get("stage") != "skin":
-        return
-
-    _, _, q_index_str, opt_index_str = q.data.split(":")
-    q_index = int(q_index_str)
-    opt_index = int(opt_index_str)
-
-    if q_index != state["step"]:
-        return
-
-    state["answers"].append(opt_index)
-    state["step"] += 1
-    USER_STATE[user_id] = state
-
-    if state["step"] < len(QUESTIONS):
-        i = state["step"]
+    # ---- INCI START ----
+    if data == "inci:start":
+        USER_STATE[user_id] = {"stage": "inci"}
         if q.message:
-            await q.message.reply_text(QUESTIONS[i]["text"], reply_markup=question_keyboard(i))
+            await q.message.reply_text(
+                "🔎 Проверка состава (INCI)\n\n"
+                "Вставь состав одним сообщением (например: Water, Glycerin, Niacinamide...)\n"
+                "Я скажу подходит ли твоему типу кожи.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⛔️ Отмена", callback_data="inci:cancel")]])
+            )
         return
 
-    # finish
-    prof = calc_profile(state["answers"])
-    db.save_profile(user_id, prof["skin_type"], prof["barrier_state"], prof["sensitivity"], prof["concerns"])
+    if data == "inci:cancel":
+        st = USER_STATE.get(user_id)
+        if st and st.get("stage") == "inci":
+            USER_STATE.pop(user_id, None)
+        if q.message:
+            await q.message.reply_text("Ок, отменено.", reply_markup=main_menu_keyboard())
+        return
 
-    age = state.get("age")
-    gender = state.get("gender")
-    USER_STATE.pop(user_id, None)
+    # ---- FAVORITES: SHOW ----
+    if data == "fav:show":
+        favs = db.list_favorites(user_id)
+        if q.message:
+            if not favs:
+                await q.message.reply_text("⭐ Набор пуст. Добавь средства из рекомендаций.", reply_markup=main_menu_keyboard())
+            else:
+                lines = ["⭐ Ваш набор:"]
+                for i, f in enumerate(favs, 1):
+                    step = f.get("step") or "-"
+                    lines.append(f"{i}. [{step}] {f.get('name')}")
+                lines.append("")
+                lines.append("Нажми «Оформить через администратора» — админ поможет с заказом.")
+                await q.message.reply_text("\n".join(lines), reply_markup=_myset_keyboard())
+        return
 
-    if q.message:
+    # ---- FAVORITES: CLEAR ----
+    if data == "fav:clear":
+        db.clear_favorites(user_id)
+        if q.message:
+            await q.message.reply_text("🗑 Набор очищен.", reply_markup=main_menu_keyboard())
+        return
+
+    # ---- FAVORITES: ADD ----
+    if data.startswith("fav:add:"):
+        # callback_data: fav:add:<step>:<idx>
+        parts = data.split(":")
+        if len(parts) != 4:
+            return
+        step = parts[2]
+        idx = int(parts[3])
+
+        prof = db.get_profile(user_id) or {}
+        routine = recommend_routine(CATALOG, prof)
+        items = routine.get(step, [])
+        if idx < 0 or idx >= len(items):
+            if q.message:
+                await q.message.reply_text("Не нашла это средство. Нажми «Подобрать уход» ещё раз.", reply_markup=main_menu_keyboard())
+            return
+
+        item, score, why = items[idx]
+        db.add_favorite(
+            user_id=user_id,
+            name=item.name,
+            url=getattr(item, "url", "") or "",
+            step=step,
+            price_after_rub=getattr(item, "price_after_rub", None),
+            price_before_rub=getattr(item, "price_before_rub", None),
+        )
+        if q.message:
+            await q.message.reply_text(f"✅ Добавила в набор: {item.name}", reply_markup=main_menu_keyboard())
+        return
+
+    # ---- PLAN 30 ----
+    if data == "plan:30":
+
+        prof = db.get_profile(user_id)
+        favs = db.list_favorites(user_id)
+
+        if not prof or not prof.get("skin_type"):
+            if q.message:
+                await q.message.reply_text(
+                    "Сначала пройди тест кожи.",
+                    reply_markup=main_menu_keyboard()
+                )
+            return
+
+        plan = build_plan_30(prof, favs)
+
+        if q.message:
+            await q.message.reply_text(
+                plan,
+                reply_markup=main_menu_keyboard()
+            )
+
+        return
+    # ---- LEAD SEND (to admin) ----
+    if data == "lead:send":
+        if ADMIN_ID == 0:
+            if q.message:
+                await q.message.reply_text("❌ Администратор не настроен (ADMIN_ID=0).", reply_markup=main_menu_keyboard())
+            return
+
+        prof = db.get_profile(user_id) or {}
+        favs = db.list_favorites(user_id)
+
+        uname = q.from_user.username or "-"
+        full_name = (q.from_user.full_name or "-").strip()
+
+        lines = []
+        lines.append("🧾 ЛИД: пользователь хочет оформить заказ")
+        lines.append("")
+        lines.append(f"user_id: {user_id}")
+        lines.append(f"username: @{uname}")
+        lines.append(f"имя: {full_name}")
+        lines.append("")
+        lines.append(f"Возраст: {prof.get('age') or '—'}")
+        lines.append(f"Пол: {prof.get('gender') or '—'}")
+        lines.append(f"Тип кожи: {prof.get('skin_type') or '—'}")
+        lines.append(f"Чувствительность: {prof.get('sensitivity') or '—'}")
+        lines.append(f"Проблемы: {prof.get('concerns') or '—'}")
+        lines.append("")
+        lines.append("⭐ Набор пользователя:")
+        if not favs:
+            lines.append("— Пусто (попросите выбрать средства из рекомендаций)")
+        else:
+            for i, f in enumerate(favs, 1):
+                step = f.get("step") or "-"
+                pa = f.get("price_after_rub")
+                pb = f.get("price_before_rub")
+                price = f"{pa} ₽ / {pb} ₽" if (pa or pb) else "-"
+                lines.append(f"{i}. [{step}] {f.get('name')} | {price}")
+                if f.get("url"):
+                    lines.append(f"   {f.get('url')}")
+        lines.append("")
+        lines.append("Команды:")
+        lines.append(f"/grant {user_id} 30")
+        lines.append(f"/receipt {user_id}")
+
+        try:
+            await context.application.bot.send_message(chat_id=ADMIN_ID, text="\n".join(lines))
+        except Forbidden:
+            if q.message:
+                await q.message.reply_text(
+                    "❌ Не могу написать админу (Telegram запретил).\n"
+                    "Админ должен открыть бота и нажать Start.",
+                    reply_markup=main_menu_keyboard()
+                )
+            return
+
+        if q.message:
+            await q.message.reply_text("✅ Отправила заявку админу. Он напишет тебе и поможет оформить заказ.", reply_markup=main_menu_keyboard())
+        return
+
+    # ---- ROUTINE MAKE (send items with favorite buttons) ----
+    if data == "routine:make":
+        prof = db.get_profile(user_id)
+        if not prof or not prof.get("skin_type"):
+            if q.message:
+                await q.message.reply_text("Сначала пройди тест кожи.", reply_markup=main_menu_keyboard())
+            return
+        if not CATALOG:
+            if q.message:
+                await q.message.reply_text("Каталог не загружен. Проверь catalog_ru.csv.", reply_markup=main_menu_keyboard())
+            return
+
+        routine = recommend_routine(CATALOG, prof)
+
+        # Короткое вступление
+        if q.message:
+            await q.message.reply_text(
+                "🧴 Подбор ухода готов!\n"
+                "Ниже я пришлю средства по шагам. Под каждым можно нажать ⭐ чтобы добавить в набор.\n\n"
+                "ℹ️ Косметика приобретается отдельно.",
+                reply_markup=main_menu_keyboard()
+            )
+
+        def fmt_price(it):
+            after = getattr(it, "price_after_rub", None) or "-"
+            before = getattr(it, "price_before_rub", None) or "-"
+            return f"{after} ₽ (после регистрации) / {before} ₽ (до регистрации)"
+
+        titles = {"cleanser": "Очищение", "toner": "Тонер", "serum": "Сыворотка", "cream": "Крем", "sunscreen": "SPF"}
+
+        for step, title in titles.items():
+            items = routine.get(step, [])
+            if not items:
+                await q.message.reply_text(f"--- {title} ---\nНет подходящих средств в каталоге.")
+                continue
+
+            await q.message.reply_text(f"--- {title} ---")
+            for idx, (item, score, why) in enumerate(items):
+                text_out = (
+                    f"{item.name}\n"
+                    f"Цена: {fmt_price(item)}\n"
+                    f"Комментарий: {why}"
+                )
+                await q.message.reply_text(
+                    text_out,
+                    reply_markup=_fav_item_keyboard(step, idx, getattr(item, "url", None))
+                )
+
+        # В конце — быстрые кнопки
         await q.message.reply_text(
-            "✅ Профиль сохранён!\n\n"
-            f"• Возраст: {age if age is not None else '—'}\n"
-            f"• Пол: {gender or '—'}\n"
-            f"• Тип кожи: {prof['skin_type']}\n"
-            f"• Барьер: {prof['barrier_state']}\n"
-            f"• Чувствительность: {prof['sensitivity']}\n"
-            f"• Проблемы: {prof['concerns']}\n\n"
-            "Теперь нажми «🧴 Подобрать уход Atomy (RU)».",
+            "Готово ✅\n\n"
+            "Открой ⭐ Мой набор, чтобы увидеть выбранные средства и отправить заявку админу.\n"
+            "Или получи 📅 План на 30 дней.",
             reply_markup=main_menu_keyboard()
         )
+        return
+
+    # если ничего не совпало
+    if q.message:
+        await q.message.reply_text("Не поняла действие. Открой меню:", reply_markup=main_menu_keyboard())
 
 
 async def handle_message(update: Update, _context: ContextTypes.DEFAULT_TYPE):
@@ -651,348 +976,75 @@ async def handle_message(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # ---- If we are in TEST AGE stage ----
     st = USER_STATE.get(user_id)
+
+    # --- TEST AGE ---
     if st and st.get("stage") == "age":
         try:
             age = int(text)
         except ValueError:
             await update.message.reply_text("Пожалуйста, введи возраст числом 🙂 Например: 25")
             return
-
         if age < 10 or age > 100:
             await update.message.reply_text("Укажи реальный возраст (от 10 до 100) 🙂")
             return
-
         st["age"] = age
         st["stage"] = "gender"
         USER_STATE[user_id] = st
-
         await update.message.reply_text("Теперь выбери пол:", reply_markup=gender_keyboard())
         return
 
-    # ---- INCI checks flow (as before) ----
-    prof = db.get_profile(user_id)
-    if not prof or not prof.get("skin_type"):
-        await update.message.reply_text("Сначала пройди тест: «✅ Пройти тест кожи».", reply_markup=main_menu_keyboard())
-        return
-
-    prem, _until = premium_status(user_id)
-    if not prem:
-        used = db.get_checks_used(user_id)
-        if used >= 3:
-            await update.message.reply_text(
-                "🚫 Лимит бесплатных проверок исчерпан (3/3).\n\n"
-                f"💎 Premium — {SUB_PRICE_RUB} ₽ / 30 дней (услуга доступа).\n"
-                "Нажми «💳 Premium».",
-                reply_markup=main_menu_keyboard()
-            )
-            return
-
-    verdict, reasons = rule_assess(text, prof)
-
-    out = []
-    out.append("✅ Вердикт: подходит" if verdict == "good" else "⚠️ Вердикт: с осторожностью" if verdict == "caution" else "❌ Вердикт: скорее не подходит")
-    if reasons:
-        out.append("Причины:")
-        out.extend([f"• {r}" for r in reasons])
-
-    out.append("")
-    out.append("ℹ️ Важно: вы оплачиваете услугу доступа к сервису. Косметика приобретается отдельно.")
-    out.append("")
-    out.extend(admin_block_lines())
-
-    if not prem:
-        db.inc_checks_used(user_id)
-        used = db.get_checks_used(user_id)
-        out.append(f"\nПроверки: {min(used, 3)}/3 (free)")
-
-    await update.message.reply_text("\n".join(out), reply_markup=main_menu_keyboard())
-
-
-async def on_routine_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Этот обработчик оставлен на случай если ты захочешь вынести routine отдельно.
-    pass
-
-
-async def on_routine_make(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # не используется, потому что routine:make обрабатывается в on_menu_click ниже
-    pass
-
-
-async def on_menu_click_extend(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # не используется
-    pass
-
-
-async def on_menu_click_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # не используется
-    pass
-
-
-async def on_menu_click_3(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # не используется
-    pass
-
-
-async def on_menu_click_routine(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
-
-
-async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Этот обработчик уже объявлен выше.
-    # Оставлено намеренно пустым, чтобы не было повторного объявления.
-    pass
-
-
-# ---- We need ONE on_menu_click. So we alias the earlier function name ----
-# (Python doesn't allow two functions with same name; above we defined it already)
-# Nothing to do here.
-
-
-async def handle_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Единый роутер callback-ов:
-    - сначала обрабатываем gender
-    - затем test answers
-    - затем остальное меню (premium/profile/routine/etc.)
-    """
-    data = update.callback_query.data
-
-    if data.startswith("test:gender:"):
-        return await on_gender_select(update, context)
-
-    if data.startswith("test:answer:"):
-        return await on_test_answer(update, context)
-
-    # иначе — в общий обработчик меню
-    return await on_menu_click(update, context)
-
-
-# ---- IMPORTANT: We restore the full original on_menu_click logic by embedding it here ----
-# Because above we "overwrote" name conflicts, we must include the real menu logic as a separate function:
-
-async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    user_id = q.from_user.id
-    db.ensure_user(user_id)
-
-    # admin
-    if q.data == "admin:show":
-        if q.message:
-            await q.message.reply_text("\n".join(admin_block_lines()), reply_markup=main_menu_keyboard())
-        return
-
-    # premium
-    if q.data == "premium:screen":
-        if q.message:
-            await q.message.reply_text(premium_screen_text(user_id), reply_markup=premium_screen_keyboard())
-        return
-
-    if q.data == "premium:terms":
-        if q.message:
-            await q.message.reply_text(TERMS_TEXT, reply_markup=main_menu_keyboard())
-        return
-
-    if q.data == "premium:pdf":
-        pdf_bytes = generate_offer_pdf(TERMS_TEXT, title="Условия Premium (публичная оферта)")
-        bio = BytesIO(pdf_bytes)
-        bio.name = "offer_premium.pdf"
-        if q.message:
-            await q.message.reply_document(document=InputFile(bio), caption="📄 PDF-оферта Premium")
-        return
-
-    if q.data == "premium:status":
-        prem, until = premium_status(user_id)
-        if q.message:
-            await q.message.reply_text(
-                f"✅ Premium активен до {until}" if prem else f"ℹ️ Premium не активен. Последняя дата: {until}",
-                reply_markup=main_menu_keyboard()
-            )
-        return
-
-    if q.data == "premium:transfer":
-        lines = []
-        lines.append(f"💸 Перевод по реквизитам: {SUB_PRICE_RUB} ₽")
-        lines.append("")
-        if PAYMENT_RECIPIENT:
-            lines.append(f"Получатель: {PAYMENT_RECIPIENT}")
-        if PAYMENT_BANK:
-            lines.append(f"Банк: {PAYMENT_BANK}")
-        if PAYMENT_PHONE:
-            lines.append(f"СБП (телефон): {PAYMENT_PHONE}")
-        if PAYMENT_CARD:
-            lines.append(f"Карта: {PAYMENT_CARD}")
-        lines.append("")
-        lines.append(f"Назначение: {PAYMENT_COMMENT or 'Premium (услуга доступа к сервису на 30 дней)'}")
-        lines.append("")
-        lines.append("После оплаты нажмите: «📩 Я оплатил(а) — отправить ID админу».")
-        lines.append("ℹ️ Косметика приобретается отдельно.")
-        if q.message:
-            await q.message.reply_text("\n".join(lines), reply_markup=premium_screen_keyboard())
-        return
-
-    if q.data == "premium:send_id":
-        if ADMIN_ID == 0:
-            if q.message:
-                await q.message.reply_text("❌ Администратор не настроен (ADMIN_ID=0).")
-            return
-
-        uname = q.from_user.username or "-"
-        full_name = (q.from_user.full_name or "-").strip()
-
-        prof = db.get_profile(user_id)
-        prof_line = ""
-        if prof:
-            prof_line = (
-                f"\nПрофиль: возраст={prof.get('age') or '-'}, пол={prof.get('gender') or '-'}, "
-                f"{prof.get('skin_type') or '-'} | {prof.get('sensitivity') or '-'} | {prof.get('concerns') or '-'}"
-            )
-        prem, until = premium_status(user_id)
-
-        text_to_admin = (
-            "📩 Пользователь сообщил об оплате Premium\n\n"
-            f"user_id: {user_id}\n"
-            f"username: @{uname}\n"
-            f"имя: {full_name}\n"
-            f"Premium: {'активен до ' + until if prem else 'не активен'}"
-            f"{prof_line}\n\n"
-            "Команды:\n"
-            f"/grant {user_id} 30\n"
-            f"/receipt {user_id}\n"
-        )
-
-        try:
-            await context.application.bot.send_message(chat_id=ADMIN_ID, text=text_to_admin)
-        except Forbidden:
-            if q.message:
-                await q.message.reply_text(
-                    "❌ Не могу написать админу (Telegram запретил).\n\n"
-                    "✅ Решение:\n"
-                    "1) Админ должен открыть этого бота и нажать Start\n"
-                    "2) Повторите кнопку «Отправить ID админу»\n\n"
-                    f"Ваш user_id: {user_id}\n"
-                    f"Админ: {ADMIN_TG or '(укажи ADMIN_TG в .env)'}",
-                    reply_markup=main_menu_keyboard()
-                )
-            return
-        except Exception:
-            if q.message:
-                await q.message.reply_text(
-                    "❌ Ошибка отправки админу. Проверь ADMIN_ID.\n"
-                    f"Ваш user_id: {user_id}",
-                    reply_markup=main_menu_keyboard()
-                )
-            return
-
-        if q.message:
-            await q.message.reply_text("✅ Отправила ваш ID админу. Он активирует Premium.", reply_markup=main_menu_keyboard())
-        return
-
-    # privacy
-    if q.data == "privacy:show":
-        if PRIVACY_URL:
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("Открыть политику на сайте", url=PRIVACY_URL)]])
-            if q.message:
-                await q.message.reply_text("📜 Политика конфиденциальности доступна по ссылке:", reply_markup=kb)
-        else:
-            if q.message:
-                await q.message.reply_text(PRIVACY_TEXT, reply_markup=main_menu_keyboard())
-        return
-
-    # profile button
-    if q.data == "profile:show":
-        prof = db.get_profile(user_id)
-        prem, until = premium_status(user_id)
-        if q.message:
-            if not prof or not prof.get("skin_type"):
-                await q.message.reply_text("Профиля ещё нет. Нажми «✅ Пройти тест кожи».", reply_markup=main_menu_keyboard())
-            else:
-                await q.message.reply_text(
-                    "👤 Твой профиль:\n"
-                    f"• Возраст: {prof.get('age') if prof.get('age') is not None else '—'}\n"
-                    f"• Пол: {prof.get('gender') or '—'}\n"
-                    f"• Тип кожи: {prof.get('skin_type') or '—'}\n"
-                    f"• Барьер: {prof.get('barrier_state') or '—'}\n"
-                    f"• Чувствительность: {prof.get('sensitivity') or '—'}\n"
-                    f"• Проблемы: {prof.get('concerns') or '—'}\n\n"
-                    f"Premium: {'✅ до ' + until if prem else 'нет'}",
-                    reply_markup=main_menu_keyboard()
-                )
-        return
-
-    # routine:make
-    if q.data == "routine:make":
+    # --- INCI MODE ---
+    if st and st.get("stage") == "inci":
         prof = db.get_profile(user_id)
         if not prof or not prof.get("skin_type"):
-            if q.message:
-                await q.message.reply_text("Сначала пройди тест кожи.", reply_markup=main_menu_keyboard())
+            USER_STATE.pop(user_id, None)
+            await update.message.reply_text("Сначала пройди тест кожи.", reply_markup=main_menu_keyboard())
             return
 
-        if not CATALOG:
-            if q.message:
-                await q.message.reply_text(
-                    "Каталог не загружен.\n\n"
-                    "Обнови catalog_ru.csv в GitHub или запусти update_catalog.py локально и закоммить файл.\n"
-                    "Потом Railway перезапустится автоматически.",
+        prem, _until = premium_status(user_id)
+        if not prem:
+            used = db.get_checks_used(user_id)
+            if used >= 3:
+                USER_STATE.pop(user_id, None)
+                await update.message.reply_text(
+                    "🚫 Лимит бесплатных проверок исчерпан (3/3).\n\n"
+                    f"💎 Premium — {SUB_PRICE_RUB} ₽ / 30 дней (услуга доступа).\n"
+                    "Нажми «💳 Premium».",
                     reply_markup=main_menu_keyboard()
                 )
-            return
+                return
 
-        routine = recommend_routine(CATALOG, prof)
+        verdict, reasons = rule_assess(text, prof)
 
-        def fmt_price(item):
-            after = item.price_after_rub or "-"
-            before = item.price_before_rub or "-"
-            return f"{after} ₽ (после регистрации) / {before} ₽ (до регистрации)"
+        out = []
+        out.append("✅ Вердикт: подходит" if verdict == "good" else "⚠️ Вердикт: с осторожностью" if verdict == "caution" else "❌ Вердикт: скорее не подходит")
+        if reasons:
+            out.append("Причины:")
+            out.extend([f"• {r}" for r in reasons])
 
-        lines = []
-        lines.append("🧴 Подбор ухода Atomy (Россия)")
-        lines.append(f"Возраст: {prof.get('age') if prof.get('age') is not None else '—'}")
-        lines.append(f"Пол: {prof.get('gender') or '—'}")
-        lines.append(f"Тип кожи: {prof.get('skin_type')}")
-        lines.append(f"Чувствительность: {prof.get('sensitivity')}")
-        lines.append(f"Особенности: {prof.get('concerns')}")
-        lines.append("")
-        lines.append("ℹ️ Косметика приобретается отдельно на официальном сайте Atomy.")
-        lines.append("")
+        out.append("")
+        out.append("ℹ️ Важно: это информационная рекомендация. Косметика приобретается отдельно.")
+        out.append("")
+        out.extend(admin_block_lines())
 
-        titles = {"cleanser": "Очищение", "toner": "Тонер", "serum": "Сыворотка", "cream": "Крем", "sunscreen": "SPF"}
-        for step, title in titles.items():
-            lines.append(f"--- {title} ---")
-            items = routine.get(step, [])
-            if not items:
-                lines.append("Нет подходящих средств в каталоге.")
-                lines.append("")
-                continue
-            for item, score, why in items:
-                lines.append(item.name)
-                lines.append(f"Цена: {fmt_price(item)}")
-                lines.append(f"Комментарий: {why}")
-                if item.url:
-                    lines.append(f"Ссылка: {item.url}")
-                lines.append("")
+        if not prem:
+            db.inc_checks_used(user_id)
+            used = db.get_checks_used(user_id)
+            out.append(f"\nПроверки: {min(used, 3)}/3 (free)")
 
-        lines.append("")
-        lines.extend(admin_block_lines())
-
-        if q.message:
-            await q.message.reply_text("\n".join(lines), reply_markup=main_menu_keyboard())
-        return
-
-    # test:start handled earlier in the router (it comes here too if clicked)
-    if q.data == "test:start":
-        USER_STATE[user_id] = {"stage": "age"}
-        if q.message:
-            await q.message.reply_text("Сколько тебе лет? Напиши числом (например 25).")
-        return
-
-    if q.data == "test:cancel":
         USER_STATE.pop(user_id, None)
-        if q.message:
-            await q.message.reply_text("Тест отменён.", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("\n".join(out), reply_markup=main_menu_keyboard())
         return
+
+    # обычный текст вне режимов — мягко направляем
+    await update.message.reply_text(
+        "Выбери действие в меню 👇\n"
+        "• Пройти тест\n"
+        "• Подобрать уход\n"
+        "• Проверить состав (INCI)",
+        reply_markup=main_menu_keyboard()
+    )
 
 
 def main():
@@ -1004,24 +1056,19 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # commands
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CommandHandler("terms", cmd_terms))
     app.add_handler(CommandHandler("privacy", cmd_privacy))
     app.add_handler(CommandHandler("offer_pdf", cmd_offer_pdf))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("myid", cmd_myid))
-    app.add_handler(CommandHandler("profile", cmd_profile))  # ✅ added
 
-    # admin
     app.add_handler(CommandHandler("grant", cmd_grant))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
     app.add_handler(CommandHandler("receipt", cmd_receipt))
 
-    # callbacks: one router handles everything
-    app.add_handler(CallbackQueryHandler(handle_callback_router))
-
-    # messages
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("Бот запущен ✅")
