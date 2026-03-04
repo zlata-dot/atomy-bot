@@ -567,8 +567,19 @@ async def on_gender_select(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     if not state or state.get("stage") != "gender":
         return
 
-    _, _, _, g = q.data.split(":")
-    gender = "Женщина" if g == "woman" else "Мужчина"
+    # callback_data: "test:gender:woman" или "test:gender:man"
+    parts = q.data.split(":")
+    if len(parts) != 3:
+        if q.message:
+            await q.message.reply_text("Ошибка выбора пола. Попробуй ещё раз.")
+        return
+
+    g = parts[2]
+    gender = "Женщина" if g == "woman" else "Мужчина" if g == "man" else None
+    if not gender:
+        if q.message:
+            await q.message.reply_text("Ошибка выбора пола. Попробуй ещё раз.")
+        return
 
     state["gender"] = gender
     state["stage"] = "skin"
@@ -576,7 +587,7 @@ async def on_gender_select(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     state["answers"] = []
     USER_STATE[user_id] = state
 
-    # сохраняем возраст+пол сразу
+    # сохраняем возраст+пол в БД
     db.set_demographics(user_id, int(state["age"]), gender)
 
     if q.message:
