@@ -24,7 +24,7 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN", "") or "").strip()
 DB_PATH = (os.getenv("DB_PATH", "cosmo.sqlite3") or "").strip()
 CATALOG_PATH = (os.getenv("CATALOG_PATH", "catalog_ru.csv") or "").strip()
 
-ADMIN_NAME = (os.getenv("ADMIN_NAME", "Администратор") or "").strip()
+ADMIN_NAME = (os.getenv("ADMIN_NAME", "Злата") or "").strip()
 ADMIN_TG = (os.getenv("ADMIN_TG", "") or "").strip()
 ADMIN_PHONE = (os.getenv("ADMIN_PHONE", "") or "").strip()
 ADMIN_NOTE = (os.getenv("ADMIN_NOTE", "") or "").strip()
